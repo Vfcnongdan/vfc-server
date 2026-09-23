@@ -5,7 +5,7 @@ import { ZaloOtpService } from './zalo-otp.service';
 import { TelegramOtpService } from './telegram-otp.service';
 import { OtpChallengeStatus } from '@prisma/client';
 
-export const FALLBACK_TIMEOUT_MS = 30000; // 30 giây fallback mặc định (Production)
+export const FALLBACK_TIMEOUT_MS = 15000; // 15 giây fallback mặc định (Production)
 export const DEFAULT_FALLBACK_TIMEOUT_MS = FALLBACK_TIMEOUT_MS;
 
 export interface DispatchOptions {
@@ -37,7 +37,7 @@ export class OtpDeliveryOrchestratorService {
    * Thời gian chờ Fallback (ms):
    * - Nếu cấu hình OTP_FALLBACK_TIMEOUT_MS trong .env -> dùng giá trị đó
    * - Môi trường development -> 3 giây (3000ms) để test nhanh
-   * - Môi trường production -> 30 giây (30000ms)
+   * - Môi trường production -> 15 giây (15000ms)
    */
   getFallbackTimeoutMs(): number {
     if (process.env.OTP_FALLBACK_TIMEOUT_MS) {
