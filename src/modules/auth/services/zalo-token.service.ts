@@ -41,7 +41,12 @@ export class ZaloTokenService {
   private readonly logger = new Logger(ZaloTokenService.name);
 
   /** Mutex Lock: Promise của request refresh đang chạy ngầm để chống Race Condition */
-  private refreshPromise: Promise<string | null> | null = null;
+  private refreshPromise: Promise<{
+    success: boolean;
+    accessToken?: string;
+    error?: string;
+    errorCode?: number;
+  }> | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -102,20 +107,28 @@ export class ZaloTokenService {
       `Token remaining time < threshold (${thresholdSeconds}s), auto-refreshing from DB refresh token...`,
     );
     if (tokenRecord.refreshToken) {
-      const newToken = await this.refreshAccessToken(tokenRecord.refreshToken);
-      if (newToken) return newToken;
+      const result = await this.refreshAccessTokenDetailed(tokenRecord.refreshToken);
+      if (result.success && result.accessToken) return result.accessToken;
+      throw new Error(
+        `Không thể tự động refresh Zalo Access Token: ${result.error || 'Zalo từ chối refresh token'}`,
+      );
     }
 
     throw new Error(
-      'Không thể tự động refresh Zalo Access Token. Vui lòng kiểm tra lại Refresh Token hoặc kích hoạt trong Admin > Cài đặt.',
+      'Không thể tự động refresh Zalo Access Token: Thiếu Refresh Token trong Database. Vui lòng kiểm tra lại trong Admin > Cài đặt.',
     );
   }
 
   /**
-   * Đổi Refresh Token lấy Access Token mới thông qua Zalo OAuth API.
+   * Đổi Refresh Token lấy Access Token mới thông qua Zalo OAuth API (kết quả chi tiết).
    * Tích hợp In-flight Promise Mutex để chống Race Condition khi nhiều request gọi cùng lúc.
    */
-  async refreshAccessToken(refreshToken: string): Promise<string | null> {
+  async refreshAccessTokenDetailed(refreshToken: string): Promise<{
+    success: boolean;
+    accessToken?: string;
+    error?: string;
+    errorCode?: number;
+  }> {
     // Nếu đang có tiến trình refresh chạy dở, tái sử dụng Promise đó
     if (this.refreshPromise) {
       this.logger.log(
@@ -130,18 +143,23 @@ export class ZaloTokenService {
       this.configService.get<string>('ZALO_APP_SECRET') ||
       process.env.ZALO_APP_SECRET;
 
-    if (!appId || !appSecret || !refreshToken) {
-      this.logger.warn(
-        'Thiếu ZALO_APP_ID, ZALO_APP_SECRET hoặc Refresh Token để thực hiện refresh.',
-      );
-      return null;
+    if (!appId || !appSecret) {
+      const err = 'Thiếu cấu hình ZALO_APP_ID hoặc ZALO_APP_SECRET trong biến môi trường (.env).';
+      this.logger.warn(err);
+      return { success: false, error: err };
+    }
+
+    if (!refreshToken || !refreshToken.trim()) {
+      const err = 'Thiếu Refresh Token để thực hiện làm mới.';
+      this.logger.warn(err);
+      return { success: false, error: err };
     }
 
     this.refreshPromise = (async () => {
       try {
         const params = new URLSearchParams();
-        params.append('refresh_token', refreshToken);
-        params.append('app_id', appId);
+        params.append('refresh_token', refreshToken.trim());
+        params.append('app_id', appId.trim());
         params.append('grant_type', 'refresh_token');
 
         const response = await fetch(
@@ -150,7 +168,7 @@ export class ZaloTokenService {
             method: 'POST',
             headers: {
               'Content-Type': 'application/x-www-form-urlencoded',
-              secret_key: appSecret,
+              secret_key: appSecret.trim(),
             },
             body: params.toString(),
           },
@@ -172,20 +190,62 @@ export class ZaloTokenService {
             refreshTokenChanged ? REFRESH_TOKEN_EXPIRES_IN_SECONDS : undefined,
           );
           this.logger.log('Refreshed Zalo Access Token successfully.');
-          return data.access_token as string;
+          return { success: true, accessToken: data.access_token as string };
         } else {
           this.logger.error('Refresh token failed from Zalo API:', data);
-          return null;
+          const errorCode = data.error;
+          const errorMsg =
+            data.error_description ||
+            data.message ||
+            data.error_name ||
+            'Lỗi không xác định từ Zalo OAuth';
+
+          let friendlyError = `Zalo OAuth API lỗi: ${errorMsg} (Mã lỗi: ${errorCode ?? 'OA'})`;
+          if (
+            errorCode === -14014 ||
+            String(errorMsg).toLowerCase().includes('invalid refresh token')
+          ) {
+            friendlyError =
+              'Refresh Token không hợp lệ (-14014) hoặc đã hết hạn 90 ngày / đã bị thu hồi. Lưu ý: Refresh Token là mã riêng biệt khác với Access Token; nếu dán nhầm Access Token vào ô Refresh Token thì Zalo sẽ từ chối.';
+          } else if (
+            errorCode === -14002 ||
+            String(errorMsg).toLowerCase().includes('invalid app id')
+          ) {
+            friendlyError = `Zalo App ID không hợp lệ (-14002). Vui lòng kiểm tra lại cấu hình ZALO_APP_ID (${appId}).`;
+          } else if (
+            errorCode === -14004 ||
+            String(errorMsg).toLowerCase().includes('invalid secret key')
+          ) {
+            friendlyError =
+              'Zalo Secret Key không hợp lệ (-14004). Vui lòng kiểm tra lại cấu hình ZALO_APP_SECRET.';
+          }
+
+          return {
+            success: false,
+            error: friendlyError,
+            errorCode,
+          };
         }
-      } catch (error) {
+      } catch (error: any) {
         this.logger.error('Exception during token refresh:', error);
-        return null;
+        return {
+          success: false,
+          error: error?.message || 'Lỗi kết nối tới Zalo OAuth API',
+        };
       } finally {
         this.refreshPromise = null;
       }
     })();
 
     return this.refreshPromise;
+  }
+
+  /**
+   * Đổi Refresh Token lấy Access Token mới thông qua Zalo OAuth API.
+   */
+  async refreshAccessToken(refreshToken: string): Promise<string | null> {
+    const result = await this.refreshAccessTokenDetailed(refreshToken);
+    return result.success ? (result.accessToken ?? null) : null;
   }
 
   /**
@@ -210,9 +270,22 @@ export class ZaloTokenService {
       };
     }
 
-    const newToken = await this.refreshAccessToken(record.refreshToken);
+    if (
+      record.accessToken &&
+      record.refreshToken &&
+      record.accessToken.trim() === record.refreshToken.trim()
+    ) {
+      return {
+        success: false,
+        error:
+          'Refresh Token trong Database đang trùng khớp với Access Token (đang bị dán nhầm cùng một mã). Access Token dùng để gửi OTP, nhưng để làm mới bạn cần lấy mã Refresh Token riêng biệt từ Zalo Developer Console và dán lại.',
+        message: 'Refresh Token bị trùng với Access Token.',
+      };
+    }
 
-    if (newToken) {
+    const result = await this.refreshAccessTokenDetailed(record.refreshToken);
+
+    if (result.success && result.accessToken) {
       const updatedStatus = await this.getTokenStatus();
       return {
         success: true,
@@ -222,9 +295,8 @@ export class ZaloTokenService {
     } else {
       return {
         success: false,
-        error:
-          'Zalo API từ chối refresh token. Có thể Refresh Token đã hết hạn 90 ngày hoặc đã bị vô hiệu hóa ở nơi khác.',
-        message: 'Làm mới token thất bại từ Zalo OAuth API.',
+        error: result.error || 'Làm mới token thất bại từ Zalo OAuth API.',
+        message: result.error || 'Làm mới token thất bại từ Zalo OAuth API.',
       };
     }
   }
